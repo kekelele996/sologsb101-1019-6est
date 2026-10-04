@@ -328,7 +328,7 @@ function verdictColor(verdict: string): string {
         <el-card shadow="never" style="margin-top: 16px">
           <template #header>整库导出</template>
           <p class="gb-muted">
-            导出文件包含 6 张业务表全量数据与结构版本号，可在其他设备通过「导入 JSON」还原。
+            导出文件包含 9 张业务表全量数据与结构版本号，可在其他设备通过「导入 JSON」还原；v2 旧备份可直接导入，补纸批次归属会按纸种帘纹自动回填。
           </p>
           <div class="gb-toolbar">
             <el-button :icon="Download" @click="handleExport">JSON 备份</el-button>

@@ -69,7 +69,8 @@ npm run preview    # 本地预览构建产物（http://localhost:22819）
 | --- | --- | --- | --- |
 | `/books` | 古籍与册次台账 | 新建古籍、按年代与保护级别筛选（同步 URL query），对话框内管理册次，装订完成后整册锁定只读 | Book、Volume |
 | `/books/:id/leaves` | 书叶破损登记 | 册次切换、逐叶录入破损类型（可叠加）、面积与 pH，批量改状态；**直接深链不存在的 id 显示友好空态** | Leaf、Volume |
-| `/papers` | 补纸选配与染色比对 | 按 ΔE 升序排列候选补纸、帘纹匹配度与综合评分，ΔE 超阈值提示重新染色 | Paper、Leaf |
+| `/papers` | 补纸选配与染色比对 | 按 ΔE 升序排列候选补纸、帘纹匹配度与综合评分，ΔE 超阈值提示重新染色；补纸按纸种帘纹归属纸库批次（历史数据自动回填） | Paper、PaperBatch、Leaf |
+| `/warehouse` | 纸库批次与领用对账 | 纸库批次台账（入库张数 / 封批 / 当下在库）；登记书叶领用时按当下在库「色差最近、不够或封批顺延下一档」选批，可跨批凑张；领用汇总按批次与出库流水对账，对不上只退回该叶、库存自动还回 | PaperBatch、PaperOutbound、PaperRequisition |
 | `/repairs` | 修复工序记录 | 拖拽调整工序先后并重编号、回填材料与操作人，完成即回写书叶状态，一键生成标准序列 | RepairOrder、Leaf |
 | `/export` | 装订还原与验收归档 | 装订登记 + 验收结论（合格触发全册归档）、JSON 导入导出、归档清单与破损台账 CSV | Binding 及全部模型 |
 
@@ -84,11 +85,17 @@ npm run preview    # 本地预览构建产物（http://localhost:22819）
 | Book 古籍 | `src/types/book.ts` | `id` `title` `edition` `era` `volumeCount` `collectionNo` `level`（一级/二级/三级/普通） | 新建后进入册次登记，卡片回显待修叶数与已完成工序数 |
 | Volume 册次 | `src/types/volume.ts` | `id` `bookId` `volumeNo` `leafCount` `bindingType`（线装/蝴蝶装/包背装） `state`（待修复/修复中/已装订/已归档） | 装订完成后整册锁定为只读 |
 | Leaf 书叶 | `src/types/leaf.ts` | `id` `volumeId` `leafNo` `damageType`（虫蛀/酸化/絮化/缺肉/水渍） `damageAreaCm2` `phValue` `state`（待修/修复中/已修复） | 同叶可叠加多种破损，按册汇总面积与平均 pH |
-| Paper 补纸 | `src/types/paper.ts` | `id` `leafId` `paperType`（竹纸/皮纸/宣纸） `laidPattern` `thicknessMm` `deltaE` `dyeRecipe` | 按色差排序候选，ΔE 超阈值提示重新染色 |
+| Paper 补纸 | `src/types/paper.ts` | `id` `leafId` `paperType`（竹纸/皮纸/宣纸） `laidPattern` `thicknessMm` `deltaE` `dyeRecipe` `batchId` | 按色差排序候选，ΔE 超阈值提示重新染色；`batchId` 为纸库批次归属（v3 按纸种+帘纹回填，回填不了为 `null` 照旧可查） |
+| PaperBatch 纸库批次 | `src/types/warehouse.ts` | `id` `batchNo` `paperType` `laidPattern` `colorDelta` `quantityIn` `sealed` | 纸库台账，记每批入库张数、批次色差与封批情况；在库 = 入库 − 未退回领用的出库合计 |
+| PaperOutbound 出库流水 | `src/types/warehouse.ts` | `id` `batchId` `requisitionId` `quantity` `operator` `date` | 纸库出库账，与领用单逐批对账；领用退回时删除该单流水，库存自动还回 |
+| PaperRequisition 领用单 | `src/types/warehouse.ts` | `id` `leafId` `paperType` `laidPattern` `targetDeltaE` `quantity` `allocations` `status`（领用中/已退回） | 书叶粒度；`allocations` 记录顺延选批后的跨批分配；对账不符只退这一叶 |
 | RepairOrder 修复工序 | `src/types/repairOrder.ts` | `id` `leafId` `seq` `name`（补破/托裱/溜口/裁齐/压平） `material` `operator` `date` `state`（未开始/进行中/已完成） | 拖拽调序，完成即回写书叶状态 |
 | Binding 装订 | `src/types/binding.ts` | `id` `volumeId` `method` `finishDate` `verdict`（合格/返修） `inspector` | 合格触发全册归档，返修退回修复中 |
 
-数据结构版本号 `DB_VERSION` 定义在 `src/utils/db.ts`，当前为 `v2`：`papers` 表增加 `dyeRecipe` 字段，并在 Dexie `.upgrade()` 中按纸种回填默认染色配方（竹纸 / 皮纸 / 宣纸 各有基准配方）。
+数据结构版本号 `DB_VERSION` 定义在 `src/utils/db.ts`，当前为 `v3`：
+
+- v1→v2：`papers` 表增加 `dyeRecipe` 字段，并在 Dexie `.upgrade()` 中按纸种回填默认染色配方。
+- v2→v3：新增 `paperBatches` / `paperOutbounds` / `paperRequisitions` 三张纸库表，`papers` 增加 `batchId`；升级时按「纸种 + 帘纹」匹配纸库批次（同档取色差最近）回填，库中无同纸种帘纹批次则置 `null`，历史记录照旧可查。导入 v2 旧备份时执行同样的回填。
 
 ---
 
@@ -98,13 +105,13 @@ npm run preview    # 本地预览构建产物（http://localhost:22819）
 sologsb101-1019/
 ├── frontend/                     # 前端源码
 │   ├── src/
-│   │   ├── types/                # book.ts volume.ts leaf.ts paper.ts repairOrder.ts binding.ts
+│   │   ├── types/                # book.ts volume.ts leaf.ts paper.ts repairOrder.ts binding.ts warehouse.ts
 │   │   ├── stores/               # bookStore.ts leafStore.ts repairStore.ts
 │   │   ├── components/common/    # DamageTag.vue FilterBar.vue StatBadge.vue EmptyPanel.vue
 │   │   ├── hooks/                # useLeafStats.ts useIdbTable.ts
-│   │   ├── pages/                # BookList.vue LeafBoard.vue PaperMatch.vue RepairWorkflow.vue ExportView.vue
+│   │   ├── pages/                # BookList.vue LeafBoard.vue PaperMatch.vue Warehouse.vue RepairWorkflow.vue ExportView.vue
 │   │   ├── router/               # index.ts
-│   │   ├── utils/                # paperColor.ts db.ts export.ts
+│   │   ├── utils/                # paperColor.ts db.ts export.ts warehouse.ts
 │   │   ├── styles/               # main.css
 │   │   ├── App.vue main.ts env.d.ts
 │   ├── public/favicon.svg
@@ -124,9 +131,9 @@ sologsb101-1019/
 
 ## 七、数据存储说明
 
-- **IndexedDB（Dexie，数据库名 `gbbookrestore`）**：6 张业务表 `books` / `volumes` / `leaves` / `papers` / `repairOrders` / `bindings`，由 `src/utils/db.ts` 统一定义 schema、版本号与升级迁移；`initDatabase()` 首次打开时自动播种**三层互相引用**的演示数据（Book → Volume → Leaf → Paper / RepairOrder，另有 Volume → Binding，固定 id 如 `book_01`、`vol_0101`、`leaf_010101`），保证 `/books/:id/leaves` 深链能命中真实 id，播种幂等。
+- **IndexedDB（Dexie，数据库名 `gbbookrestore`）**：9 张业务表 `books` / `volumes` / `leaves` / `papers` / `repairOrders` / `bindings` / `paperBatches` / `paperOutbounds` / `paperRequisitions`，由 `src/utils/db.ts` 统一定义 schema、版本号与升级迁移；`initDatabase()` 首次打开时自动播种**三层互相引用**的演示数据（Book → Volume → Leaf → Paper / RepairOrder，另有 Volume → Binding，固定 id 如 `book_01`、`vol_0101`、`leaf_010101`），纸库侧播种 6 个批次（含一档已封批的近色竹纸）与 1 张示例领用单 / 出库流水，保证 `/books/:id/leaves` 深链能命中真实 id，播种幂等。
 - **localStorage**：仅存元数据 —— `gbbookrestore:db-version`（本地结构版本）、`gbbookrestore:last-backup-at`（最近导出时间）、`gbbookrestore:ui-prefs`（当前古籍 / 册次、工序排序方式）。
-- **备份**：`/export` 页可导出 JSON（6 张表全量数据 + 结构版本号），导入时校验 `app` 字段与各集合数组完整性，覆盖导入前二次确认；另有归档清单 TXT 与书叶破损台账 CSV。
+- **备份**：`/export` 页可导出 JSON（9 张表全量数据 + 结构版本号；导入 v2 旧备份缺纸库三表时按空集合兼容并回填 `batchId`），导入时校验 `app` 字段与各核心集合数组完整性，覆盖导入前二次确认；另有归档清单 TXT 与书叶破损台账 CSV。
 - **隐私与无状态**：数据不上传任何服务器，容器不挂载命名卷；清理浏览器站点数据或更换浏览器会丢失档案，请定期导出备份。
 
 ---

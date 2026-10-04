@@ -20,6 +20,11 @@ export interface Paper {
   deltaE: number;
   /** 染色配方（v2 迁移时按纸种回填默认值） */
   dyeRecipe: string;
+  /**
+   * 归属纸库批次 id（v3 迁移时按纸种 + 帘纹回填，回填不了为 null，记录照旧可查）。
+   * 仅表示选配归属；登记领用的实际批次以纸库当下在库顺延结果为准。
+   */
+  batchId: string | null;
   createdAt: number;
   updatedAt: number;
 }
@@ -70,5 +75,6 @@ export function createEmptyPaperDraft(leafId: string): PaperDraft {
     thicknessMm: 0.06,
     deltaE: 1.5,
     dyeRecipe: DEFAULT_DYE_RECIPE.bamboo,
+    batchId: null
   };
 }

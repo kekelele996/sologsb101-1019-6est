@@ -14,6 +14,7 @@ import StatBadge from '@/components/common/StatBadge.vue'
 import { useIdbTable } from '@/hooks/useIdbTable'
 import { useBookStore } from '@/stores/bookStore'
 import { useLeafStore } from '@/stores/leafStore'
+import type { PaperBatch } from '@/types/warehouse'
 import {
   DEFAULT_DYE_RECIPE,
   DELTA_E_THRESHOLD,
@@ -39,6 +40,7 @@ import {
 const bookStore = useBookStore()
 const leafStore = useLeafStore()
 const paperTable = useIdbTable<Paper>((database) => database.papers, { sortByUpdatedAt: false })
+const batchTable = useIdbTable<PaperBatch>((database) => database.paperBatches, { sortByUpdatedAt: false })
 
 const FILTER_KEYS = ['paperType', 'laidPattern'] as const
 const url = useFilterQuery(FILTER_KEYS)
@@ -76,6 +78,19 @@ function leafPattern(leafId: string): string {
   if (!leaf) return '二指帘纹'
   return leaf.damageType === 'stain' ? '细帘纹' : '二指帘纹'
 }
+
+/** 批次归属：v3 升级时按纸种 + 帘纹回填；回填不了显示「未归属」，记录照旧可查 */
+function batchLabel(batchId: string | null | undefined): string {
+  if (!batchId) return ''
+  return batchTable.rows.value.find((batch) => batch.id === batchId)?.batchNo ?? ''
+}
+
+/** 同纸种同帘纹的可归属批次（编辑补纸时下拉选择，允许留空） */
+const batchOptions = computed(() =>
+  batchTable.rows.value.filter(
+    (batch) => batch.paperType === form.paperType && batch.laidPattern === form.laidPattern
+  )
+)
 
 const rows = computed(() => {
   const keyword = url.keyword.value.trim()
@@ -153,7 +168,8 @@ function openEdit(paper: Paper): void {
     laidPattern: paper.laidPattern,
     thicknessMm: paper.thicknessMm,
     deltaE: paper.deltaE,
-    dyeRecipe: paper.dyeRecipe
+    dyeRecipe: paper.dyeRecipe,
+    batchId: paper.batchId ?? null
   })
   dialog.value = true
 }
@@ -237,13 +253,19 @@ async function selectCandidate(type: PaperType, deltaE: number, laidPatternValue
   const existing = paperTable.rows.value.find(
     (item) => item.leafId === candidateLeafId.value && item.paperType === type
   )
+  // 归属批次缺省时按纸种 + 帘纹自动带出（同档取色差最近）
+  const autoBatchId =
+    batchTable.rows.value
+      .filter((batch) => batch.paperType === type && batch.laidPattern === laidPatternValue)
+      .sort((a, b) => Math.abs(a.colorDelta - deltaE) - Math.abs(b.colorDelta - deltaE))[0]?.id ?? null
   const payload: PaperDraft = {
     leafId: candidateLeafId.value,
     paperType: type,
     laidPattern: laidPatternValue,
     thicknessMm,
     deltaE,
-    dyeRecipe: DEFAULT_DYE_RECIPE[type]
+    dyeRecipe: DEFAULT_DYE_RECIPE[type],
+    batchId: existing?.batchId ?? autoBatchId
   }
   if (existing) {
     await paperTable.update(existing.id, payload)
@@ -322,6 +344,14 @@ function deltaTag(deltaE: number): { label: string; color: string } {
             </el-table-column>
             <el-table-column label="纸种" width="90">
               <template #default="{ row }">{{ PAPER_TYPE_LABEL[row.paperType as PaperType] }}</template>
+            </el-table-column>
+            <el-table-column label="归属批次" width="130">
+              <template #default="{ row }">
+                <el-tag v-if="batchLabel(row.batchId)" type="info" effect="plain" size="small" round>
+                  {{ batchLabel(row.batchId) }}
+                </el-tag>
+                <el-tag v-else type="warning" effect="plain" size="small" round>未归属（照旧可查）</el-tag>
+              </template>
             </el-table-column>
             <el-table-column label="帘纹" width="150">
               <template #default="{ row }">
@@ -416,6 +446,17 @@ function deltaTag(deltaE: number): { label: string; color: string } {
             <el-option v-for="item in LAID_PATTERN_OPTIONS" :key="item" :label="item" :value="item" />
           </el-select>
           <span class="gb-muted">与目标帘纹匹配度 {{ formMatch }}%</span>
+        </el-form-item>
+        <el-form-item label="归属批次">
+          <el-select v-model="form.batchId" clearable placeholder="按纸种帘纹回填，可留空" style="width: 100%">
+            <el-option
+              v-for="batch in batchOptions"
+              :key="batch.id"
+              :label="`${batch.batchNo} · ΔE ${batch.colorDelta}${batch.sealed ? ' · 已封批' : ''}`"
+              :value="batch.id"
+            />
+          </el-select>
+          <span class="gb-muted">仅记录选配归属；实际领用按纸库当下在库顺延选批</span>
         </el-form-item>
         <el-form-item label="厚度(mm)">
           <el-input-number v-model="form.thicknessMm" :min="0.01" :max="0.5" :step="0.01" :precision="2" />

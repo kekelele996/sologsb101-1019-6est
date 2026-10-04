@@ -5,7 +5,7 @@
  */
 import { computed, onMounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { Brush, Document, Files, Reading, Tools } from '@element-plus/icons-vue'
+import { Box, Brush, Document, Files, Reading, Tools } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
 import { useBookStore } from '@/stores/bookStore'
 import { useLeafStore } from '@/stores/leafStore'
@@ -44,6 +44,7 @@ const navItems = computed(() => {
       disabled: !bookId
     },
     { path: '/papers', label: '补纸选配', icon: Brush, badge: '', disabled: false },
+    { path: '/warehouse', label: '纸库领用', icon: Box, badge: '', disabled: false },
     { path: '/repairs', label: '修复工序', icon: Tools, badge: String(repairStore.totalSteps), disabled: false },
     { path: '/export', label: '装订归档', icon: Files, badge: '', disabled: false }
   ]
