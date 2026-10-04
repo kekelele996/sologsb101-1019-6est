@@ -14,6 +14,7 @@ import { useLeafStats } from '@/hooks/useLeafStats'
 import { useBookStore } from '@/stores/bookStore'
 import { useLeafStore } from '@/stores/leafStore'
 import { useRepairStore } from '@/stores/repairStore'
+import { usePaperStore } from '@/stores/paperStore'
 import {
   BINDING_METHOD_OPTIONS,
   BINDING_VERDICT_COLOR,
@@ -42,12 +43,14 @@ import {
   copyText,
   exportArchiveReport,
   exportLeafLedgerCsv,
+  exportPaperReconcileCsv,
   exportSnapshotJson
 } from '@/utils/export'
 
 const bookStore = useBookStore()
 const leafStore = useLeafStore()
 const repairStore = useRepairStore()
+const paperStore = usePaperStore()
 const { totals } = useLeafStats()
 const bindingTable = useIdbTable<Binding>((database) => database.bindings, { sortByUpdatedAt: false })
 const paperTable = useIdbTable<Paper>((database) => database.papers, { sortByUpdatedAt: false })
@@ -92,6 +95,8 @@ const context = computed(() => ({
   volumes: bookStore.volumes,
   leaves: leafStore.leaves,
   papers: paperTable.rows.value,
+  paperBatches: paperStore.batches,
+  requisitions: paperStore.requisitions,
   repairOrders: repairStore.orders,
   bindings: bindingTable.rows.value
 }))
@@ -208,7 +213,13 @@ async function handleFile(event: Event): Promise<void> {
     return
   }
   await importSnapshot(parsed as RestoreSnapshot)
-  await Promise.all([bookStore.loadBooks(), bookStore.loadVolumes(), leafStore.loadLeaves(), repairStore.loadOrders()])
+  await Promise.all([
+    bookStore.loadBooks(),
+    bookStore.loadVolumes(),
+    leafStore.loadLeaves(),
+    repairStore.loadOrders(),
+    paperStore.loadPaperData()
+  ])
   ElMessage.success('导入完成，数据已覆盖')
 }
 
@@ -223,7 +234,13 @@ async function handleReset(): Promise<void> {
     return
   }
   await resetDatabase()
-  await Promise.all([bookStore.loadBooks(), bookStore.loadVolumes(), leafStore.loadLeaves(), repairStore.loadOrders()])
+  await Promise.all([
+    bookStore.loadBooks(),
+    bookStore.loadVolumes(),
+    leafStore.loadLeaves(),
+    repairStore.loadOrders(),
+    paperStore.loadPaperData()
+  ])
   ElMessage.success('已清空并重新载入演示数据')
 }
 
@@ -333,6 +350,7 @@ function verdictColor(verdict: string): string {
           <div class="gb-toolbar">
             <el-button :icon="Download" @click="handleExport">JSON 备份</el-button>
             <el-button @click="exportLeafLedgerCsv(context)">书叶破损台账 CSV</el-button>
+            <el-button @click="exportPaperReconcileCsv(context)">批次领用对账 CSV</el-button>
           </div>
           <el-alert
             style="margin-top: 10px"

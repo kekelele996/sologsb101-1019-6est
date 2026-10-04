@@ -20,6 +20,15 @@ export interface Paper {
   deltaE: number;
   /** 染色配方（v2 迁移时按纸种回填默认值） */
   dyeRecipe: string;
+  /**
+   * 归属纸库批次 id（v3 接入纸库）：
+   * - 新登记的配纸指向领用选中的在库批次
+   * - 历史数据 v2→v3 升级时按纸种 + 帘纹回填
+   * - 回填不了（帘纹无匹配批次等）时保持空串，旧记录照旧可查
+   */
+  batchId: string;
+  /** 批次归属是否为升级回填（true = 按纸种 + 帘纹推断，非修复师登记时指定） */
+  batchBackfilled: boolean;
   createdAt: number;
   updatedAt: number;
 }
@@ -70,5 +79,7 @@ export function createEmptyPaperDraft(leafId: string): PaperDraft {
     thicknessMm: 0.06,
     deltaE: 1.5,
     dyeRecipe: DEFAULT_DYE_RECIPE.bamboo,
+    batchId: '',
+    batchBackfilled: false,
   };
 }

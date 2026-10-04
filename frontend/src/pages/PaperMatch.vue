@@ -1,22 +1,28 @@
 <script setup lang="ts">
 /**
- * /papers 补纸选配与染色比对
- * 按 ΔE 排序候选补纸并记录染色配方；ΔE 超阈值时提示重新染色。
- * 消费 Paper、Leaf；复用 <FilterBar>、<StatBadge>、<EmptyPanel>、<DamageTag>。
+ * /papers 补纸选配与纸库领用
+ * 三个页签：
+ * 1. 配纸登记：按 ΔE 排序候选补纸；配纸记录接上纸库批次归属（登记领用后回写）
+ * 2. 纸库批次：入库张数 / 已出库 / 封批（BatchStockPanel）
+ * 3. 领用对账：按叶登记领用（在库批次按色差顺延），按批次与纸库出库对账（ReconcilePanel）
  */
-import { computed, reactive, ref, watch } from 'vue'
+import { computed, provide, reactive, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Delete, Edit, Plus } from '@element-plus/icons-vue'
+import { Delete, Edit, Plus, Sell } from '@element-plus/icons-vue'
 import DamageTag from '@/components/common/DamageTag.vue'
 import EmptyPanel from '@/components/common/EmptyPanel.vue'
 import FilterBar, { useFilterQuery, type FilterModel } from '@/components/common/FilterBar.vue'
 import StatBadge from '@/components/common/StatBadge.vue'
+import BatchStockPanel from '@/components/paper/BatchStockPanel.vue'
+import ReconcilePanel from '@/components/paper/ReconcilePanel.vue'
+import RequisitionDialog from '@/components/paper/RequisitionDialog.vue'
+import { PAPER_LIST_GETTER_KEY } from '@/components/paper/injection'
 import { useIdbTable } from '@/hooks/useIdbTable'
 import { useBookStore } from '@/stores/bookStore'
 import { useLeafStore } from '@/stores/leafStore'
+import { usePaperStore } from '@/stores/paperStore'
 import {
   DEFAULT_DYE_RECIPE,
-  DELTA_E_THRESHOLD,
   LAID_PATTERN_OPTIONS,
   PAPER_TYPE_LABEL,
   PAPER_TYPE_OPTIONS,
@@ -26,19 +32,25 @@ import {
   type PaperDraft,
   type PaperType
 } from '@/types/paper'
-import { DAMAGE_TYPE_LABEL } from '@/types/leaf'
+import { BATCH_STATE_LABEL } from '@/types/paperBatch'
+import { DAMAGE_TYPE_LABEL, type Leaf } from '@/types/leaf'
 import {
   PAPER_BASE_COLOR,
   candidateScore,
   deltaEForLeaf,
   laidPatternMatch,
-  needRedye,
-  recipeConcentration
+  needRedye
 } from '@/utils/paperColor'
 
 const bookStore = useBookStore()
 const leafStore = useLeafStore()
+const paperStore = usePaperStore()
 const paperTable = useIdbTable<Paper>((database) => database.papers, { sortByUpdatedAt: false })
+
+// 领用对话框通过注入复用本页已有的全量配纸订阅
+provide(PAPER_LIST_GETTER_KEY, () => paperTable.rows.value)
+
+const activeTab = ref<'match' | 'stock' | 'reconcile'>('match')
 
 const FILTER_KEYS = ['paperType', 'laidPattern'] as const
 const url = useFilterQuery(FILTER_KEYS)
@@ -77,6 +89,10 @@ function leafPattern(leafId: string): string {
   return leaf.damageType === 'stain' ? '细帘纹' : '二指帘纹'
 }
 
+function batchOfPaper(paper: Paper) {
+  return paper.batchId ? paperStore.batchById(paper.batchId) : undefined
+}
+
 const rows = computed(() => {
   const keyword = url.keyword.value.trim()
   const types = url.values.value.paperType ?? []
@@ -93,9 +109,7 @@ const rows = computed(() => {
   return [...list].sort((a, b) => {
     if (sortBy.value === 'thickness') return a.thicknessMm - b.thicknessMm
     if (sortBy.value === 'score') {
-      return (
-        candidateScore(b, leafPattern(b.leafId)) - candidateScore(a, leafPattern(a.leafId))
-      )
+      return candidateScore(b, leafPattern(b.leafId)) - candidateScore(a, leafPattern(a.leafId))
     }
     return a.deltaE - b.deltaE
   })
@@ -110,12 +124,12 @@ const stat = computed(() => {
     averageDeltaE,
     redye: list.filter((paper) => needRedye(paper.deltaE)).length,
     coveredLeaves: new Set(list.map((paper) => paper.leafId)).size,
+    linked: list.filter((paper) => paper.batchId && paperStore.batchById(paper.batchId)).length,
+    unlinked: list.filter((paper) => !paper.batchId || !paperStore.batchById(paper.batchId)).length,
     matchRate:
       list.length === 0
         ? 0
-        : Math.round(
-            (list.filter((paper) => !needRedye(paper.deltaE)).length / list.length) * 100
-          )
+        : Math.round((list.filter((paper) => !needRedye(paper.deltaE)).length / list.length) * 100)
   }
 })
 
@@ -158,7 +172,6 @@ function openEdit(paper: Paper): void {
   dialog.value = true
 }
 
-// 纸种变化时带出默认染色配方
 watch(
   () => form.paperType,
   (type: PaperType) => {
@@ -169,19 +182,17 @@ watch(
   }
 )
 
-const recipePreview = computed(() => recipeConcentration(form.paperType, form.deltaE, 1))
-const formMatch = computed(() => laidPatternMatch(form.laidPattern, '二指帘纹'))
-
 async function submit(): Promise<void> {
   if (!form.leafId) {
     ElMessage.warning('请选择关联书叶')
     return
   }
   if (editing.value) {
+    // 批次归属只由领用出库回写，编辑配纸不改批次
     await paperTable.update(editing.value.id, { ...form })
     ElMessage.success('已更新补纸记录')
   } else {
-    await paperTable.create({ ...form }, 'paper')
+    await paperTable.create({ ...form, batchId: '', batchBackfilled: false }, 'paper')
     ElMessage.success(needRedye(form.deltaE) ? '已新增补纸，色差超阈值需重新染色' : '已新增补纸记录')
   }
   dialog.value = false
@@ -189,7 +200,7 @@ async function submit(): Promise<void> {
 
 async function remove(paper: Paper): Promise<void> {
   try {
-    await ElMessageBox.confirm('将删除该补纸选配记录。', '删除补纸', {
+    await ElMessageBox.confirm('将删除该补纸选配记录（不影响已登记的领用与纸库出库）。', '删除补纸', {
       type: 'warning',
       confirmButtonText: '确认删除',
       cancelButtonText: '取消'
@@ -213,15 +224,15 @@ const candidates = computed(() => {
       (item) => item.leafId === leaf.id && item.paperType === option.value
     )
     const deltaE = paper ? paper.deltaE : deltaEForLeaf(leaf.damageType, option.value)
-    const laidPattern = paper ? paper.laidPattern : patterns[leaf.leafNo % patterns.length]
+    const laidPatternValue = paper ? paper.laidPattern : patterns[leaf.leafNo % patterns.length]
     const thicknessMm = paper ? paper.thicknessMm : 0.06
     return {
       type: option.value,
       label: PAPER_TYPE_LABEL[option.value],
       deltaE,
-      laidPattern,
+      laidPattern: laidPatternValue,
       thicknessMm,
-      score: candidateScore({ deltaE, laidPattern, thicknessMm }, '二指帘纹'),
+      score: candidateScore({ deltaE, laidPattern: laidPatternValue, thicknessMm }, '二指帘纹'),
       hasRecord: Boolean(paper),
       paperId: paper?.id ?? ''
     }
@@ -243,7 +254,9 @@ async function selectCandidate(type: PaperType, deltaE: number, laidPatternValue
     laidPattern: laidPatternValue,
     thicknessMm,
     deltaE,
-    dyeRecipe: DEFAULT_DYE_RECIPE[type]
+    dyeRecipe: DEFAULT_DYE_RECIPE[type],
+    batchId: existing?.batchId ?? '',
+    batchBackfilled: existing?.batchBackfilled ?? false
   }
   if (existing) {
     await paperTable.update(existing.id, payload)
@@ -257,189 +270,259 @@ async function selectCandidate(type: PaperType, deltaE: number, laidPatternValue
 function deltaTag(deltaE: number): { label: string; color: string } {
   return deltaELevel(deltaE)
 }
+
+/* ----------------------------- 按叶领用 ----------------------------- */
+const requisitionDialogVisible = ref(false)
+const requisitionLeaf = ref<Leaf | null>(null)
+const requisitionPaperType = ref<PaperType | ''>('')
+
+function openRequisition(leafId: string, paperType: PaperType | '' = ''): void {
+  const leaf = leafStore.leafById(leafId)
+  if (!leaf) {
+    ElMessage.warning('书叶不存在')
+    return
+  }
+  requisitionLeaf.value = leaf
+  requisitionPaperType.value = paperType
+  requisitionDialogVisible.value = true
+}
 </script>
 
 <template>
   <div>
     <div class="gb-page-head">
       <div>
-        <h2>补纸选配与染色比对</h2>
+        <h2>补纸选配与纸库领用</h2>
         <p>
-          按 ΔE 升序排列候选补纸（阈值 {{ DELTA_E_THRESHOLD }}），记录帘纹、厚度与染色配方；超阈值会提示重新染色。
+          配纸按色差 ΔE 排序；领用登记时只从纸库当下在库批次挑，色差最近的批次封存或张数不足自动顺延下一档。
         </p>
       </div>
       <div class="gb-toolbar">
-        <el-select v-model="sortBy" style="width: 160px">
-          <el-option label="按 ΔE 升序" value="deltaE" />
-          <el-option label="按厚度升序" value="thickness" />
-          <el-option label="按综合评分" value="score" />
-        </el-select>
-        <el-button type="primary" :icon="Plus" @click="openCreate">新增补纸</el-button>
+        <el-radio-group v-model="activeTab">
+          <el-radio-button value="match">配纸登记</el-radio-button>
+          <el-radio-button value="stock">纸库批次</el-radio-button>
+          <el-radio-button value="reconcile">领用对账</el-radio-button>
+        </el-radio-group>
       </div>
     </div>
 
-    <div class="gb-stat-row">
-      <StatBadge label="补纸记录" :value="stat.total" suffix="条" tone="primary" />
-      <StatBadge label="平均 ΔE" :value="stat.averageDeltaE" tone="warning" />
-      <StatBadge label="需重新染色" :value="stat.redye" suffix="条" tone="danger" />
-      <StatBadge label="覆盖书叶" :value="stat.coveredLeaves" suffix="叶" tone="info" />
-      <StatBadge label="ΔE 达标率" :value="`${stat.matchRate}%`" :percent="stat.matchRate" tone="success" />
-    </div>
+    <!-- ============ 配纸登记 ============ -->
+    <template v-if="activeTab === 'match'">
+      <div class="gb-stat-row">
+        <StatBadge label="补纸记录" :value="stat.total" suffix="条" tone="primary" />
+        <StatBadge label="平均 ΔE" :value="stat.averageDeltaE" tone="warning" />
+        <StatBadge label="需重新染色" :value="stat.redye" suffix="条" tone="danger" />
+        <StatBadge label="已接纸库批次" :value="stat.linked" suffix="条" tone="success" />
+        <StatBadge label="未归属 / 回填不了" :value="stat.unlinked" suffix="条" tone="info" />
+      </div>
 
-    <FilterBar
-      :model-value="filterModel"
-      :selects="filterSelects"
-      keyword-placeholder="搜索书叶 / 配方 / 厚度…"
-      @change="handleFilterChange"
-      @reset="url.reset()"
-    />
+      <div style="display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap">
+        <FilterBar
+          style="flex: 1; min-width: 320px"
+          :model-value="filterModel"
+          :selects="filterSelects"
+          keyword-placeholder="搜索书叶 / 配方 / 厚度…"
+          @change="handleFilterChange"
+          @reset="url.reset()"
+        />
+        <div class="gb-toolbar">
+          <el-select v-model="sortBy" style="width: 150px">
+            <el-option label="按 ΔE 升序" value="deltaE" />
+            <el-option label="按厚度升序" value="thickness" />
+            <el-option label="按综合评分" value="score" />
+          </el-select>
+          <el-button type="primary" :icon="Plus" @click="openCreate">新增补纸</el-button>
+        </div>
+      </div>
 
-    <el-row :gutter="16" style="margin-top: 16px">
-      <el-col :xs="24" :xl="16">
-        <el-card shadow="never">
-          <EmptyPanel
-            v-if="rows.length === 0"
-            :title="paperTable.rows.value.length === 0 ? '还没有补纸选配记录' : '当前条件下没有记录'"
-            :description="
-              paperTable.rows.value.length === 0
-                ? '为破损书叶选配补纸，记录纸种、帘纹、厚度、色差与染色配方。'
-                : '试着调整纸种或帘纹筛选条件。'
-            "
-            action-text="新增补纸"
-            secondary-text="重置筛选"
-            size="small"
-            @action="openCreate"
-            @secondary="url.reset()"
-          />
-          <el-table v-else :data="rows" size="small" border>
-            <el-table-column label="关联书叶" min-width="200">
-              <template #default="{ row }">
-                <div>{{ leafLabel(row.leafId) }}</div>
+      <el-row :gutter="16" style="margin-top: 16px">
+        <el-col :xs="24" :xl="16">
+          <el-card shadow="never">
+            <EmptyPanel
+              v-if="rows.length === 0"
+              :title="paperTable.rows.value.length === 0 ? '还没有补纸选配记录' : '当前条件下没有记录'"
+              :description="
+                paperTable.rows.value.length === 0
+                  ? '为破损书叶选配补纸；登记领用后自动接上纸库批次。'
+                  : '试着调整纸种或帘纹筛选条件。'
+              "
+              action-text="新增补纸"
+              secondary-text="重置筛选"
+              size="small"
+              @action="openCreate"
+              @secondary="url.reset()"
+            />
+            <el-table v-else :data="rows" size="small" border>
+              <el-table-column label="关联书叶" min-width="190">
+                <template #default="{ row }">
+                  <div>{{ leafLabel(row.leafId) }}</div>
+                  <div class="gb-muted">
+                    <DamageTag v-if="leafStore.leafById(row.leafId)" :type="leafStore.leafById(row.leafId)!.damageType" size="small" />
+                  </div>
+                </template>
+              </el-table-column>
+              <el-table-column label="纸种" width="80">
+                <template #default="{ row }">{{ PAPER_TYPE_LABEL[row.paperType as PaperType] }}</template>
+              </el-table-column>
+              <el-table-column label="帘纹" width="140">
+                <template #default="{ row }">
+                  {{ row.laidPattern }}
+                  <el-tag size="small" effect="plain" round>{{ laidPatternMatch(row.laidPattern, leafPattern(row.leafId)) }}%</el-tag>
+                </template>
+              </el-table-column>
+              <el-table-column prop="deltaE" label="ΔE" width="110">
+                <template #default="{ row }">
+                  {{ row.deltaE }}
+                  <el-tag :style="{ color: deltaTag(row.deltaE).color, borderColor: `${deltaTag(row.deltaE).color}66` }" effect="plain" size="small" round>
+                    {{ deltaTag(row.deltaE).label }}
+                  </el-tag>
+                </template>
+              </el-table-column>
+              <el-table-column label="纸库批次归属" min-width="170">
+                <template #default="{ row }">
+                  <template v-if="batchOfPaper(row)">
+                    <div>
+                      <strong>{{ batchOfPaper(row)!.batchNo }}</strong>
+                      <el-tag
+                        :type="batchOfPaper(row)!.state === 'sealed' ? 'warning' : 'success'"
+                        effect="plain"
+                        size="small"
+                        round
+                      >
+                        {{ BATCH_STATE_LABEL[batchOfPaper(row)!.state] }}
+                      </el-tag>
+                    </div>
+                    <div class="gb-muted">
+                      在库余量 {{ batchOfPaper(row)!.receivedSheets - batchOfPaper(row)!.issuedSheets }} 张
+                      <el-tag v-if="row.batchBackfilled" size="small" effect="plain" round>升级回填</el-tag>
+                    </div>
+                  </template>
+                  <el-tooltip v-else content="历史数据无批次归属，升级按纸种 + 帘纹回填失败（纸库无同纸种同帘纹批次）；登记领用后补上" placement="top">
+                    <el-tag type="info" effect="plain" size="small" round>未归属（照旧可查）</el-tag>
+                  </el-tooltip>
+                </template>
+              </el-table-column>
+              <el-table-column label="操作" width="220">
+                <template #default="{ row }">
+                  <el-button size="small" text type="primary" :icon="Sell" @click="openRequisition(row.leafId, row.paperType)">
+                    登记领用
+                  </el-button>
+                  <el-button size="small" text :icon="Edit" @click="openEdit(row)">编辑</el-button>
+                  <el-button size="small" text type="danger" :icon="Delete" @click="remove(row)">删除</el-button>
+                </template>
+              </el-table-column>
+            </el-table>
+          </el-card>
+        </el-col>
+
+        <el-col :xs="24" :xl="8">
+          <el-card shadow="never">
+            <template #header>
+              <div style="display: flex; align-items: center; justify-content: space-between">
+                <span>候选补纸推荐</span>
+                <el-button size="small" type="primary" plain :icon="Sell" :disabled="!candidateLeafId" @click="openRequisition(candidateLeafId, '')">
+                  为该书叶领用
+                </el-button>
+              </div>
+            </template>
+            <el-select v-model="candidateLeafId" placeholder="选择需要配纸的书叶" style="width: 100%; margin-bottom: 10px">
+              <el-option v-for="item in leafOptions" :key="item.value" :label="item.label" :value="item.value" />
+            </el-select>
+
+            <EmptyPanel
+              v-if="candidates.length === 0"
+              title="选择书叶后生成候选"
+              description="将按 ΔE、帘纹匹配度与厚度接近度综合评分排序。"
+              size="small"
+            />
+            <div v-else style="display: flex; flex-direction: column; gap: 10px">
+              <div v-for="item in candidates" :key="item.type">
+                <div class="gb-paper-swatch" :style="{ background: PAPER_BASE_COLOR[item.type] }" />
+                <div style="display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 6px">
+                  <div>
+                    <strong>{{ item.label }}</strong>
+                    <span class="gb-muted"> · 评分 {{ item.score }}</span>
+                  </div>
+                  <el-tag :type="needRedye(item.deltaE) ? 'danger' : 'success'" effect="plain" size="small" round>
+                    ΔE {{ item.deltaE }}
+                  </el-tag>
+                </div>
                 <div class="gb-muted">
-                  <DamageTag v-if="leafStore.leafById(row.leafId)" :type="leafStore.leafById(row.leafId)!.damageType" size="small" />
+                  帘纹 {{ item.laidPattern }}（匹配 {{ laidPatternMatch(item.laidPattern, candidateLeafPattern) }}%）· 厚度
+                  {{ item.thicknessMm }}mm · {{ item.hasRecord ? '已有登记' : '尚无登记（按基准色估算）' }}
                 </div>
-              </template>
-            </el-table-column>
-            <el-table-column label="纸种" width="90">
-              <template #default="{ row }">{{ PAPER_TYPE_LABEL[row.paperType as PaperType] }}</template>
-            </el-table-column>
-            <el-table-column label="帘纹" width="150">
-              <template #default="{ row }">
-                {{ row.laidPattern }}
-                <el-tag size="small" effect="plain" round>{{ laidPatternMatch(row.laidPattern, leafPattern(row.leafId)) }}%</el-tag>
-              </template>
-            </el-table-column>
-            <el-table-column prop="thicknessMm" label="厚度(mm)" width="100" />
-            <el-table-column label="ΔE" width="140" sortable>
-              <template #default="{ row }">
-                {{ row.deltaE }}
-                <el-tag :style="{ color: deltaTag(row.deltaE).color, borderColor: `${deltaTag(row.deltaE).color}66` }" effect="plain" size="small" round>
-                  {{ deltaTag(row.deltaE).label }}
-                </el-tag>
-              </template>
-            </el-table-column>
-            <el-table-column label="综合评分" width="100">
-              <template #default="{ row }">{{ candidateScore(row, leafPattern(row.leafId)) }}</template>
-            </el-table-column>
-            <el-table-column label="染色配方" min-width="200">
-              <template #default="{ row }">
-                <el-tag v-if="needRedye(row.deltaE)" type="danger" effect="plain" size="small" round>需重新染色</el-tag>
-                <div class="gb-muted">{{ row.dyeRecipe }}</div>
-              </template>
-            </el-table-column>
-            <el-table-column label="操作" width="150">
-              <template #default="{ row }">
-                <el-button size="small" text :icon="Edit" @click="openEdit(row)">编辑</el-button>
-                <el-button size="small" text type="danger" :icon="Delete" @click="remove(row)">删除</el-button>
-              </template>
-            </el-table-column>
-          </el-table>
-        </el-card>
-      </el-col>
-
-      <el-col :xs="24" :xl="8">
-        <el-card shadow="never">
-          <template #header>候选补纸推荐</template>
-          <el-select v-model="candidateLeafId" placeholder="选择需要配纸的书叶" style="width: 100%; margin-bottom: 10px">
-            <el-option v-for="item in leafOptions" :key="item.value" :label="item.label" :value="item.value" />
-          </el-select>
-
-          <EmptyPanel
-            v-if="candidates.length === 0"
-            title="选择书叶后生成候选"
-            description="将按 ΔE、帘纹匹配度与厚度接近度综合评分排序。"
-            size="small"
-          />
-          <div v-else style="display: flex; flex-direction: column; gap: 10px">
-            <div v-for="item in candidates" :key="item.type">
-              <div class="gb-paper-swatch" :style="{ background: PAPER_BASE_COLOR[item.type] }" />
-              <div style="display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 6px">
-                <div>
-                  <strong>{{ item.label }}</strong>
-                  <span class="gb-muted"> · 评分 {{ item.score }}</span>
+                <div style="margin-top: 6px; display: flex; gap: 8px">
+                  <el-button size="small" @click="selectCandidate(item.type, item.deltaE, item.laidPattern, item.thicknessMm)">
+                    {{ item.hasRecord ? '更新为采用' : '采用该候选' }}
+                  </el-button>
+                  <el-button size="small" type="primary" plain :icon="Sell" @click="openRequisition(candidateLeafId, item.type)">
+                    领用
+                  </el-button>
                 </div>
-                <el-tag :type="needRedye(item.deltaE) ? 'danger' : 'success'" effect="plain" size="small" round>
-                  ΔE {{ item.deltaE }}
-                </el-tag>
               </div>
-              <div class="gb-muted">
-                帘纹 {{ item.laidPattern }}（匹配 {{ laidPatternMatch(item.laidPattern, candidateLeafPattern) }}%）· 厚度
-                {{ item.thicknessMm }}mm · {{ item.hasRecord ? '已有登记' : '尚无登记（按基准色估算）' }}
-              </div>
-              <el-button
-                size="small"
-                style="margin-top: 6px"
-                @click="selectCandidate(item.type, item.deltaE, item.laidPattern, item.thicknessMm)"
-              >
-                {{ item.hasRecord ? '更新为采用' : '采用该候选' }}
-              </el-button>
             </div>
-          </div>
-        </el-card>
-      </el-col>
-    </el-row>
+          </el-card>
+        </el-col>
+      </el-row>
 
-    <el-dialog v-model="dialog" :title="editing ? '编辑补纸记录' : '新增补纸记录'" width="620px">
-      <el-form label-width="110px">
-        <el-form-item label="关联书叶" required>
-          <el-select v-model="form.leafId" style="width: 100%" filterable>
-            <el-option v-for="item in leafOptions" :key="item.value" :label="item.label" :value="item.value" />
-          </el-select>
-        </el-form-item>
-        <el-form-item label="纸种" required>
-          <el-select v-model="form.paperType" style="width: 100%">
-            <el-option v-for="item in PAPER_TYPE_OPTIONS" :key="item.value" :label="item.label" :value="item.value" />
-          </el-select>
-        </el-form-item>
-        <el-form-item label="帘纹">
-          <el-select v-model="form.laidPattern" style="width: 100%">
-            <el-option v-for="item in LAID_PATTERN_OPTIONS" :key="item" :label="item" :value="item" />
-          </el-select>
-          <span class="gb-muted">与目标帘纹匹配度 {{ formMatch }}%</span>
-        </el-form-item>
-        <el-form-item label="厚度(mm)">
-          <el-input-number v-model="form.thicknessMm" :min="0.01" :max="0.5" :step="0.01" :precision="2" />
-        </el-form-item>
-        <el-form-item label="色差 ΔE">
-          <el-input-number v-model="form.deltaE" :min="0" :max="20" :step="0.1" :precision="1" />
-          <el-tag
-            style="margin-left: 8px"
-            :style="{ color: deltaTag(form.deltaE).color, borderColor: `${deltaTag(form.deltaE).color}66` }"
-            effect="plain"
-            round
-          >
-            {{ deltaTag(form.deltaE).label }}
-          </el-tag>
-        </el-form-item>
-        <el-form-item label="染色配方">
-          <el-input v-model="form.dyeRecipe" type="textarea" :rows="2" />
-          <span class="gb-muted">{{ recipePreview.note }}</span>
-        </el-form-item>
-      </el-form>
-      <template #footer>
-        <el-button @click="dialog = false">取消</el-button>
-        <el-button type="primary" @click="submit">保存</el-button>
-      </template>
-    </el-dialog>
+      <el-dialog v-model="dialog" :title="editing ? '编辑补纸记录' : '新增补纸记录'" width="620px">
+        <el-form label-width="110px">
+          <el-form-item label="关联书叶" required>
+            <el-select v-model="form.leafId" style="width: 100%" filterable>
+              <el-option v-for="item in leafOptions" :key="item.value" :label="item.label" :value="item.value" />
+            </el-select>
+          </el-form-item>
+          <el-form-item label="纸种" required>
+            <el-select v-model="form.paperType" style="width: 100%">
+              <el-option v-for="item in PAPER_TYPE_OPTIONS" :key="item.value" :label="item.label" :value="item.value" />
+            </el-select>
+          </el-form-item>
+          <el-form-item label="帘纹">
+            <el-select v-model="form.laidPattern" style="width: 100%">
+              <el-option v-for="item in LAID_PATTERN_OPTIONS" :key="item" :label="item" :value="item" />
+            </el-select>
+          </el-form-item>
+          <el-form-item label="厚度(mm)">
+            <el-input-number v-model="form.thicknessMm" :min="0.01" :max="0.5" :step="0.01" :precision="2" />
+          </el-form-item>
+          <el-form-item label="色差 ΔE">
+            <el-input-number v-model="form.deltaE" :min="0" :max="20" :step="0.1" :precision="1" />
+            <el-tag
+              style="margin-left: 8px"
+              :style="{ color: deltaTag(form.deltaE).color, borderColor: `${deltaTag(form.deltaE).color}66` }"
+              effect="plain"
+              round
+            >
+              {{ deltaTag(form.deltaE).label }}
+            </el-tag>
+          </el-form-item>
+          <el-form-item label="染色配方">
+            <el-input v-model="form.dyeRecipe" type="textarea" :rows="2" />
+          </el-form-item>
+          <el-alert
+            type="info"
+            :closable="false"
+            show-icon
+            title="纸库批次不由此处手填：保存配纸后用「登记领用」，系统按纸库当下在库批次挑批次并回写归属。"
+          />
+        </el-form>
+        <template #footer>
+          <el-button @click="dialog = false">取消</el-button>
+          <el-button type="primary" @click="submit">保存</el-button>
+        </template>
+      </el-dialog>
+    </template>
+
+    <!-- ============ 纸库批次 ============ -->
+    <BatchStockPanel v-else-if="activeTab === 'stock'" />
+
+    <!-- ============ 领用对账 ============ -->
+    <ReconcilePanel v-else />
+
+    <RequisitionDialog
+      v-model="requisitionDialogVisible"
+      :leaf="requisitionLeaf"
+      :initial-paper-type="requisitionPaperType"
+    />
   </div>
 </template>

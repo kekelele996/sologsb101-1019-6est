@@ -6,14 +6,18 @@ import type { Book } from '@/types/book'
 import type { Volume } from '@/types/volume'
 import type { Leaf } from '@/types/leaf'
 import type { Paper } from '@/types/paper'
+import type { PaperBatch } from '@/types/paperBatch'
+import type { Requisition } from '@/types/requisition'
 import type { RepairOrder } from '@/types/repairOrder'
 import type { Binding } from '@/types/binding'
 import { BOOK_LEVEL_LABEL } from '@/types/book'
 import { BINDING_TYPE_LABEL, VOLUME_STATE_LABEL } from '@/types/volume'
 import { DAMAGE_TYPE_LABEL, LEAF_STATE_LABEL } from '@/types/leaf'
 import { PAPER_TYPE_LABEL, deltaELevel } from '@/types/paper'
+import { REQUISITION_STATE_LABEL } from '@/types/requisition'
 import { REPAIR_NAME_LABEL } from '@/types/repairOrder'
 import { BINDING_VERDICT_LABEL } from '@/types/binding'
+import { reconcileRequisitions } from './paperRequisition'
 import type { RestoreSnapshot } from './db'
 
 /** 触发浏览器下载 */
@@ -53,6 +57,8 @@ export interface ExportContext {
   volumes: Volume[]
   leaves: Leaf[]
   papers: Paper[]
+  paperBatches: PaperBatch[]
+  requisitions: Requisition[]
   repairOrders: RepairOrder[]
   bindings: Binding[]
 }
@@ -90,6 +96,16 @@ export function buildArchiveReport(context: ExportContext): string {
         lines.push(
           `      · 第 ${leaf.leafNo} 叶　${DAMAGE_TYPE_LABEL[leaf.damageType]}　${leaf.damageAreaCm2} cm²　pH ${leaf.phValue}　${LEAF_STATE_LABEL[leaf.state]}　工序 ${done}/${orders.length}`
         )
+        // 按叶列示领用批次与张数（已退回的领用单独标注，不占批次库存）
+        const requisitions = context.requisitions
+          .filter((item) => item.leafId === leaf.id)
+          .sort((a, b) => a.date.localeCompare(b.date))
+        requisitions.forEach((item) => {
+          const batch = context.paperBatches.find((entry) => entry.id === item.batchId)
+          const batchText = batch ? `${batch.batchNo}（${PAPER_TYPE_LABEL[batch.paperType]}）` : '纸库查无此批'
+          const stateText = item.state === 'issued' ? '' : `　${REQUISITION_STATE_LABEL[item.state]}`
+          lines.push(`         领用 ${item.date}　${batchText}　${item.sheets} 张${stateText}　${item.operator || '未填领用人'}`)
+        })
       })
     })
     lines.push('')
@@ -104,7 +120,7 @@ export function exportArchiveReport(context: ExportContext): string {
   return filename
 }
 
-/** 书叶破损台账 CSV（含补纸与工序进度） */
+/** 书叶破损台账 CSV（含补纸批次归属、领用与工序进度） */
 export function exportLeafLedgerCsv(context: ExportContext): string {
   const header = [
     '书名',
@@ -120,6 +136,9 @@ export function exportLeafLedgerCsv(context: ExportContext): string {
     '色差ΔE',
     'ΔE判定',
     '染色配方',
+    '归属批次',
+    '批次状态',
+    '未退回领用张数',
     '工序进度',
     '最近工序',
     '操作人'
@@ -133,6 +152,10 @@ export function exportLeafLedgerCsv(context: ExportContext): string {
         .sort((a, b) => a.leafNo - b.leafNo)
       leaves.forEach((leaf) => {
         const paper = context.papers.find((item) => item.leafId === leaf.id)
+        const batch = paper?.batchId ? context.paperBatches.find((item) => item.id === paper.batchId) : undefined
+        const issuedSheets = context.requisitions
+          .filter((item) => item.leafId === leaf.id && item.state === 'issued')
+          .reduce((sum, item) => sum + item.sheets, 0)
         const orders = context.repairOrders
           .filter((order) => order.leafId === leaf.id)
           .sort((a, b) => a.seq - b.seq)
@@ -153,6 +176,15 @@ export function exportLeafLedgerCsv(context: ExportContext): string {
             paper ? paper.deltaE : '',
             paper ? deltaELevel(paper.deltaE).label : '',
             paper ? paper.dyeRecipe : '',
+            batch
+              ? batch.batchNo
+              : paper
+                ? paper.batchId
+                  ? '纸库查无此批'
+                  : '历史未归属'
+                : '',
+            batch ? (batch.state === 'sealed' ? '已封批' : '在库') : '',
+            issuedSheets,
             `${done}/${orders.length}`,
             last ? REPAIR_NAME_LABEL[last.name] : '',
             last ? last.operator : ''
@@ -164,6 +196,42 @@ export function exportLeafLedgerCsv(context: ExportContext): string {
     })
   })
   const filename = `古籍书叶破损台账-${stampSuffix()}.csv`
+  download(filename, `\uFEFF${lines.join('\n')}`, 'text/csv;charset=utf-8')
+  return filename
+}
+
+/** 纸库批次与领用对账 CSV：按批次汇总出库与领用，逐叶列明细 */
+export function exportPaperReconcileCsv(context: ExportContext): string {
+  const result = reconcileRequisitions(context.paperBatches, context.requisitions)
+  const leafLabelOf = (leafId: string): string => {
+    const leaf = context.leaves.find((item) => item.id === leafId)
+    if (!leaf) return `书叶 ${leafId}（已删除）`
+    const volume = context.volumes.find((item) => item.id === leaf.volumeId)
+    const book = volume ? context.books.find((item) => item.id === volume.bookId) : undefined
+    return `《${book?.title ?? '?'}》第 ${volume?.volumeNo ?? '?'} 册 · 第 ${leaf.leafNo} 叶`
+  }
+  const header = ['批次号', '纸种', '帘纹', '批次状态', '入库张数', '纸库出库张数', '领用汇总张数', '差额(出库-领用)', '对账', '书叶', '该叶领用张数']
+  const lines: string[] = [header.map(csvCell).join(',')]
+  result.rows.forEach((row) => {
+    const base = [
+      row.batch?.batchNo ?? '纸库查无此批',
+      row.batch ? PAPER_TYPE_LABEL[row.batch.paperType] : '',
+      row.batch?.laidPattern ?? '',
+      row.batch ? (row.batch.state === 'sealed' ? '已封批' : '在库') : '',
+      row.batch?.receivedSheets ?? '',
+      row.issuedSheets,
+      row.requisitionSheets,
+      row.diff,
+      row.matched ? '对平' : '对不上'
+    ]
+    if (row.leafLines.length === 0) {
+      lines.push([...base, '', ''].map(csvCell).join(','))
+    }
+    row.leafLines.forEach((line) => {
+      lines.push([...base, leafLabelOf(line.leafId), line.sheets].map(csvCell).join(','))
+    })
+  })
+  const filename = `补纸批次领用对账-${stampSuffix()}.csv`
   download(filename, `\uFEFF${lines.join('\n')}`, 'text/csv;charset=utf-8')
   return filename
 }
